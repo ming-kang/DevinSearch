@@ -1,0 +1,43 @@
+{
+	"name": "devin-search-mcp",
+	"version": "0.1.0",
+	"description": "MCP server for Devin's code_search (SWE-grep over the local workspace) and web_search",
+	"type": "module",
+	"license": "MIT",
+	"bin": {
+		"devin-search-mcp": "dist/cli.js"
+	},
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"engines": {
+		"node": ">=18"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"test": "vitest --run",
+		"check": "tsc --noEmit && vitest --run"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.18.0",
+		"zod": "^3.25.0"
+	},
+	"optionalDependencies": {
+		"@vscode/ripgrep": "^1.15.9"
+	},
+	"devDependencies": {
+		"@types/node": "^22.10.0",
+		"typescript": "^5.7.0",
+		"vitest": "^2.1.0"
+	}
+}
