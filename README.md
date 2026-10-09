@@ -1,132 +1,83 @@
-# devin-search-mcp
+# @astralyn/search
 
-[Devin](https://devin.ai)'s code search as an MCP server: `code_search` finds where behavior lives in
-the local workspace, and `web_search` answers from the live web. Both are the tools Pi's `/search`
-extension exposes, extracted to run standalone under any MCP client.
+An MCP server with two tools, powered by [Devin](https://devin.ai):
 
-```jsonc
-// Claude Code / Claude Desktop / VS Code / any MCP client
-{
-  "mcpServers": {
-    "devin-search": {
-      "command": "npx",
-      "args": ["-y", "devin-search-mcp"]
-    }
-  }
-}
-```
+- **`code_search`** finds where behavior lives in your workspace from a description of it, and returns candidate files with line ranges.
+- **`web_search`** searches the live web, and returns titles, URLs, and the page excerpts that match the query.
 
-## Tools
+## Setup
 
-### `code_search`
+1. Get a key. This opens Devin's sign-in page, and prints the key once you paste back the code Devin shows you:
 
-Find where behavior lives in the local repository by describing it, powered by Devin's SWE-grep
-planner. Use it when the relevant files are unknown: exploration, tracing a flow or bug, planning a
-change in unfamiliar code. Returns candidate files with line ranges — a reading list to verify with
-`read` or `grep`. For known paths, exact symbols, or literal strings, use grep/find/read directly.
+   ```bash
+   npx @astralyn/search login
+   ```
 
-- `query` (string, required) — natural-language description of the behavior, flow, error, or
-  concept to locate. Keep identifiers, API names, and error text verbatim.
-- `path` (string, optional) — subdirectory to search, relative to the workspace root. Defaults to
-  the whole root. The planner sees it as `/codebase`; results stay root-relative.
+2. Add the server to your MCP client, with the key in its `env`:
 
-The search is **read-only and confined to the workspace root**: the planner can only name `rg`,
-`readfile`, and `tree` commands against a virtual `/codebase`, and every path it names must resolve
-inside the root both lexically and after following symlinks. There is no shell and no write.
+   ```json
+   {
+     "mcpServers": {
+       "search": {
+         "command": "npx",
+         "args": ["-y", "@astralyn/search"],
+         "env": { "SEARCH_KEY": "<the key login printed>" }
+       }
+     }
+   }
+   ```
 
-### `web_search`
+   With Claude Code: `claude mcp add search -e SEARCH_KEY=<key> -- npx -y @astralyn/search`.
 
-Search the live web through Devin. Use it for facts outside the repository: library and API docs,
-error messages, release notes, current versions. Returns titles, URLs, and query-relevant excerpts.
+   On Windows, clients that cannot start `npx` directly need `"command": "cmd"` and `"args": ["/c", "npx", "-y", "@astralyn/search"]`.
 
-- `query` (string, required)
-- `max_results` (integer 1–10, optional, default 5)
+3. Restart the client. The key in the server's `env` is the only authorization; nothing is written to disk.
 
-Both tools read-only (`readOnlyHint`), and `code_search` streams progress notifications
-(`Planning (round 1/3)…`, `Running 3 commands (round 2/3)…`, …) when the client asks for them.
+Node.js 22 or later is required.
 
-## Credential
+## code_search
 
-There is exactly one credential source: the `SEARCH_KEY` environment variable, set by the MCP
-client in its server config. The server writes nothing to disk and reads nothing from any other
-tool's config directories — it is standalone. The variable is read on every call.
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `query` | string | required | The behavior, flow, error, or concept to locate, in concise English. Keep identifiers and error text verbatim. |
+| `path` | string | first workspace root | Directory to search: absolute inside a workspace root, or relative to the first root. |
 
-```bash
-npx devin-search-mcp login   # browser sign-in; prints the SEARCH_KEY to paste into your client
-```
+The query and a directory tree go to Devin's SWE-grep model, which plans up to three rounds of up to eight read-only commands (`rg`, `readfile`, and `tree`). This server runs them on your machine and returns the files and line ranges the model answers with, as absolute paths. Treat them as a reading list to verify, not as evidence.
 
-`login` opens Devin's sign-in page, you paste the one-time code back (or paste a raw token), the
-code is exchanged for the session token, one cheap authenticated call checks it, and the finished
-key is printed for you to paste:
+**What leaves your machine:** the query, the directory tree, and the output of the commands the model runs, including the file contents it reads.
 
-```jsonc
-{
-  "mcpServers": {
-    "devin-search": {
-      "command": "npx",
-      "args": ["-y", "devin-search-mcp"],
-      "env": { "SEARCH_KEY": "devin-session-token$eyJ…" }
-    }
-  }
-}
-```
+**Enforced locally, not by Devin:**
 
-A bare Devin session JWT (`eyJ…`) is accepted and gains the `devin-session-token$` prefix it needs
-at request time; an already prefixed key passes through unchanged. Restart the MCP session after
-editing the client config.
+- **Confinement.** Every path the model names must resolve inside the searched directory, both as written and after following symlinks.
+- **Ignored files stay local.** The model sees only what ripgrep would search. Anything excluded by `.gitignore`, `.ignore`, or `.rgignore` (even outside a git repository) is neither listed, searched, nor read, even when the model names it. So, at any depth, are `.git` and dependency and cache directories such as `node_modules`, `.venv`, and `__pycache__`. To hide more, such as a committed `vendor/`, add it to `.ignore`.
+- **Read-only.** The three commands are the only operations; there is no shell and no write.
+- **Bounded output.** Each command result is capped at 40 lines of 200 characters.
+
+**Workspace root.** The server asks the client for its MCP roots, and asks again when the client reports a change. Without roots, it uses `SEARCH_ROOT`, then the directory the server was started in.
+
+Ripgrep comes from the optional `@vscode/ripgrep` dependency; if that install failed, `rg` must be on `PATH`.
+
+## web_search
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `query` | string | required | Be specific: product names, versions, exact error text. English matches best. |
+| `max_results` | integer | 5 | Results to return, 1 to 10. |
+
+The server's MCP instructions tell the model the current month, so it searches with the right year, and to cite the results it uses.
 
 ## Environment variables
 
-| Variable      | Default | Meaning                                                        |
-| ------------- | ------- | -------------------------------------------------------------- |
-| `SEARCH_KEY`  | —       | Devin API key / session token. The only credential source.     |
-| `SEARCH_ROOT` | —       | Workspace root when the client offers no MCP roots.            |
-| `SEARCH_RG_PATH` | —    | ripgrep binary override for `code_search`.                     |
-| `SEARCH_ROOT`    | —                           | Workspace root when the client offers no MCP roots.           |
-| `SEARCH_RG_PATH` | —                           | ripgrep binary override for `code_search`.                    |
-
-The workspace root normally comes from the client's MCP roots (VS Code, Claude Code, …), falling
-back to `SEARCH_ROOT`, then to the server process's cwd. Every search is confined to that root.
-
-## How it works
-
-`code_search` is a small agent loop: up to 3 planning rounds in which Devin's SWE-grep model
-receives a repo map and answers with one `restricted_exec` tool call (up to 8 `rg`/`readfile`/
-`tree` commands executed locally by this process) or a final `answer` naming files and line ranges.
-The model-facing result is the same text Pi's extension produces, so agents that already know the
-Pi tools behave identically.
-
-```
-stdio MCP client ──tools/call──▶ server.ts ──▶ tools.ts ──▶ code-search.ts (loop)
-                                                  │                ├─ devin.ts  (SWE-grep planner, Connect+protobuf)
-                                                  │                └─ workspace.ts (rg / readfile / tree, confined)
-                                                  └─▶ devin.ts    (GetWebSearchResults)
-```
-
-The Devin (Windsurf) wire protocol is undocumented; the field numbers, the client identity
-constants, and the JSON-repair heuristics in `code-search.ts` are the minimum the backend accepts
-and were verified against it. If searches start failing with `invalid_argument`, those constants in
-`src/devin.ts` are the first place to look.
-
-Ripgrep comes from the `@vscode/ripgrep` optional dependency, with `rg` from `PATH` as fallback;
-`SEARCH_RG_PATH` overrides both.
+| Variable | Description |
+|---|---|
+| `SEARCH_KEY` | The key `login` prints. Required by both tools. |
+| `SEARCH_ROOT` | Workspace root for clients that offer no MCP roots. |
 
 ## Development
 
 ```bash
 npm install
-npm run build     # tsc → dist/
-npm test          # vitest (planner loop, confinement, rg backend, MCP session)
+npm run check   # Biome and TypeScript
+npm test        # offline: Devin's replies are scripted
+npm run build
 ```
-
-The test suite runs fully offline: Devin's replies are scripted and injected as `fetch` stubs, and
-the MCP layer is exercised over the SDK's in-memory transport.
-
-## Provenance
-
-Ported from the Devin Search extension of [`@astralyn/pi`](https://www.npmjs.com/package/@astralyn/pi)
-(`src/extensions/search/`): the protocol client, planner prompt, agent loop, and workspace
-confinement are carried over as-is. The Pi-specific parts (tool registration, TUI panels, Pi's
-grep tool and tool downloader, Pi's credential storage) were replaced by the MCP server, the
-`@vscode/ripgrep` backend, and the `SEARCH_KEY` environment variable — no file storage of any kind,
-and no dependency on Pi at build or run time.

@@ -1,10 +1,14 @@
-// The two Devin (Windsurf) endpoints, reverse-engineered: there is no published schema, and the
-// field numbers and client identity below are the minimum the backend accepts — dropping any of
-// them makes it answer `invalid_argument`.
-//
-// - `GetDevstralStream` is one planner turn: a Connect-streaming protobuf request carrying a chat
-//   transcript and tool schemas, answered by one text completion.
-// - `GetWebSearchResults` is a Connect-unary JSON request answered by `{ results: [...] }`.
+/**
+ * The two Devin (Windsurf) endpoints the search tools call. Both authenticate with the API key
+ * inside the request body; neither needs a JWT exchange, a rate-limit preflight, or host details.
+ *
+ * - `GetDevstralStream` is one turn of the SWE-grep planner: a Connect-streaming protobuf request
+ *   carrying a chat transcript and tool schemas, answered by one text completion.
+ * - `GetWebSearchResults` is a Connect-unary JSON request answered by `{ results: [...] }`.
+ *
+ * There is no published schema. The field numbers and the client identity below are the minimum
+ * the backend accepts; dropping any of them makes it answer `invalid_argument`.
+ */
 import { gunzipSync, gzipSync } from "node:zlib";
 
 const SERVICE = "https://server.self-serve.windsurf.com/exa.api_server_pb.ApiServerService";
@@ -18,6 +22,7 @@ export class DevinError extends Error {
 	override name = "DevinError";
 }
 
+/** The credential is missing, revoked, or malformed; only signing in again fixes it. */
 export class DevinAuthError extends DevinError {
 	override name = "DevinAuthError";
 }
@@ -52,6 +57,8 @@ async function post(url: string, init: RequestInit, signal?: AbortSignal): Promi
 	}
 	return response;
 }
+
+// --- Protobuf, just enough for these messages ---
 
 function varint(value: number): number[] {
 	const bytes: number[] = [];
@@ -97,10 +104,14 @@ function readField(data: Buffer, no: number): Buffer[] {
 	return out;
 }
 
+// --- Planner turn ---
+
 export interface ChatMessage {
 	role: "system" | "user" | "assistant" | "tool";
 	content: string;
+	/** On an assistant message: the tool call it made. */
 	call?: { id: string; name: string; arguments: string };
+	/** On a tool message: the id of the call it answers. */
 	callId?: string;
 }
 
@@ -126,8 +137,10 @@ export function encodeChatRequest(apiKey: string, messages: ChatMessage[], tools
 	return Buffer.concat(parts);
 }
 
-// Connect streaming envelopes: a flags byte (bit 0 gzip, bit 1 end-of-stream) and a big-endian
-// length. Data frames carry text chunks in field 2; the end frame is JSON naming an error, if any.
+/**
+ * Connect streaming envelopes: a flags byte (bit 0 gzip, bit 1 end-of-stream) and a length. Data
+ * frames carry text chunks in field 2; the end frame is JSON that names an error, if any.
+ */
 export function decodeChatResponse(body: Buffer): string {
 	let text = "";
 	let i = 0;
@@ -174,9 +187,12 @@ export async function chat(
 	return decodeChatResponse(Buffer.from(await response.arrayBuffer()));
 }
 
+// --- Web search ---
+
 export interface WebResult {
 	url: string;
 	title?: string;
+	/** Query-relevant excerpts of the page, joined by `...`; up to about 4,000 characters. */
 	summary?: string;
 }
 

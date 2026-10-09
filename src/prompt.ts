@@ -1,7 +1,12 @@
+/** Planning rounds before the final answer is forced, commands per round, and files per answer. */
 export const MAX_TURNS = 3;
 export const MAX_COMMANDS = 8;
 export const MAX_RESULTS = 10;
 
+/**
+ * The SWE-grep planner prompt, kept close to the Windsurf original the backend model was tuned on.
+ * The budgets it states are the ones code-search.ts enforces.
+ */
 export const SYSTEM_PROMPT = `You are an expert software engineer, responsible for providing context \
 to another engineer to solve a code issue in the current codebase. \
 The user will present you with a description of the issue, and it is \
@@ -193,6 +198,7 @@ const COMMAND_SCHEMA = {
 	],
 };
 
+/** The planner's two tools, in the OpenAI function format the backend expects. */
 export const TOOL_DEFINITIONS = JSON.stringify([
 	{
 		type: "function",

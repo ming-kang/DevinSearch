@@ -1,3 +1,10 @@
+/**
+ * code_search: Devin's SWE-grep model plans, this process executes.
+ *
+ * Each round sends the transcript to Devin, which replies with one tool call: `restricted_exec`
+ * (up to eight rg/readfile/tree commands, run locally by `Workspace`) or `answer` (an `<ANSWER>`
+ * document of files and line ranges). After `MAX_TURNS` rounds the answer is demanded.
+ */
 import { randomUUID } from "node:crypto";
 import { relative } from "node:path";
 import { type ChatMessage, chat } from "./devin.ts";
@@ -13,6 +20,7 @@ import {
 import { type Command, VIRTUAL_ROOT, Workspace } from "./workspace.ts";
 
 export interface CodeLocation {
+	/** Relative to the session's working directory. */
 	path: string;
 	ranges: Array<[number, number]>;
 }
@@ -20,18 +28,18 @@ export interface CodeLocation {
 export interface CodeSearchOptions {
 	apiKey: string;
 	query: string;
+	/** Directory to search; already confined to the working directory by the caller. */
 	root: string;
 	cwd: string;
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
-	workspace?: Workspace;
 }
 
 export async function codeSearch(options: CodeSearchOptions): Promise<CodeLocation[]> {
 	const { apiKey, query, signal } = options;
 	const progress = options.onProgress ?? (() => {});
-	const workspace = options.workspace ?? new Workspace(options.root);
-	const map = workspace.repoMap();
+	const workspace = new Workspace(options.root);
+	const map = await workspace.repoMap(signal);
 	const messages: ChatMessage[] = [
 		{ role: "system", content: SYSTEM_PROMPT },
 		{
@@ -83,7 +91,7 @@ export interface ToolCall {
 	args: Record<string, unknown>;
 }
 
-/** `thinking[TOOL_CALLS]name[ARGS]{json}`; the JSON is the first balanced object, repaired if needed. */
+/** `thinking[TOOL_CALLS]name[ARGS]{json}`. The JSON is the first balanced object, repaired if needed. */
 export function parseToolCall(text: string): ToolCall | null {
 	const m = text.match(/\[TOOL_CALLS\]\s*(\w+)\s*\[ARGS\]\s*(\{[\s\S]*)/);
 	if (!m) return null;
@@ -122,6 +130,7 @@ function repairKeys(json: string): string {
 const FILE_RE = /<file\s+path=(["'])(.+?)\1\s*>([\s\S]*?)<\/file>/g;
 const RANGE_RE = /<range>\s*(\d+)\s*-\s*(\d+)\s*<\/range>/g;
 
+/** The files of an `<ANSWER>`, each re-checked against the workspace; anything outside it is dropped. */
 export function parseAnswer(xml: string, workspace: Workspace, cwd: string): CodeLocation[] {
 	const locations: CodeLocation[] = [];
 	for (const [, , path, body] of xml.matchAll(FILE_RE)) {

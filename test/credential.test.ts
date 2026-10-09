@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { createSignIn, exchangeCode, getApiKey, looksLikeToken } from "../src/credential.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_KEY } from "../src/config.ts";
+import { createSignIn, exchangeCode, getApiKey, looksLikeToken } from "../src/credential.ts";
 
 const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzZXNzaW9uX2lkIjoieCJ9.c2ln";
 

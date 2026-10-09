@@ -1,43 +1,51 @@
 {
-	"name": "devin-search-mcp",
+	"name": "@astralyn/search",
 	"version": "0.1.0",
-	"description": "MCP server for Devin's code_search (SWE-grep over the local workspace) and web_search",
+	"description": "MCP server for semantic code search and live web search, powered by Devin",
 	"type": "module",
 	"license": "MIT",
+	"author": "Astralyn",
+	"keywords": [
+		"mcp",
+		"mcp-server",
+		"code-search",
+		"web-search",
+		"devin"
+	],
 	"bin": {
-		"devin-search-mcp": "dist/cli.js"
-	},
-	"main": "./dist/index.js",
-	"types": "./dist/index.d.ts",
-	"exports": {
-		".": {
-			"types": "./dist/index.d.ts",
-			"import": "./dist/index.js"
-		}
+		"search": "dist/cli.js"
 	},
 	"files": [
 		"dist",
 		"README.md",
+		"CHANGELOG.md",
 		"LICENSE"
 	],
 	"engines": {
-		"node": ">=18"
+		"node": ">=22"
 	},
 	"scripts": {
-		"build": "tsc -p tsconfig.build.json",
+		"clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+		"build": "npm run clean && tsc -p tsconfig.build.json",
+		"format": "biome check --write .",
+		"check": "biome check --error-on-warnings . && tsc --noEmit",
 		"test": "vitest --run",
-		"check": "tsc --noEmit && vitest --run"
+		"prepublishOnly": "npm run check && npm test && npm run build"
 	},
 	"dependencies": {
-		"@modelcontextprotocol/sdk": "^1.18.0",
-		"zod": "^3.25.0"
+		"@modelcontextprotocol/sdk": "1.32.1",
+		"zod": "3.25.76"
 	},
 	"optionalDependencies": {
-		"@vscode/ripgrep": "^1.15.9"
+		"@vscode/ripgrep": "1.18.0"
 	},
 	"devDependencies": {
-		"@types/node": "^22.10.0",
-		"typescript": "^5.7.0",
-		"vitest": "^2.1.0"
+		"@biomejs/biome": "2.3.5",
+		"@types/node": "22.20.5",
+		"typescript": "5.9.3",
+		"vitest": "4.1.11"
+	},
+	"publishConfig": {
+		"access": "public"
 	}
 }

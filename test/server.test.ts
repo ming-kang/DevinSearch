@@ -1,21 +1,24 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gunzipSync, gzipSync } from "node:zlib";
 import { pathToFileURL } from "node:url";
+import { gzipSync } from "node:zlib";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ListRootsRequestSchema, ProgressNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENV_KEY, ENV_ROOT } from "../src/config.ts";
 import { createServer } from "../src/server.ts";
 
 let root: string;
+let other: string;
 beforeEach(() => {
 	root = mkdtempSync(join(tmpdir(), "devin-search-server-"));
 	mkdirSync(join(root, "src"));
 	writeFileSync(join(root, "src", "retry.ts"), "export function retry() {\n  return 1;\n}\n");
 	writeFileSync(join(root, "src", "notes.md"), "# notes\n");
+	other = mkdtempSync(join(tmpdir(), "devin-search-other-"));
+	writeFileSync(join(other, "billing.ts"), "export const charge = 1;\n");
 	process.env[ENV_KEY] = "test-key";
 	delete process.env[ENV_ROOT];
 });
@@ -23,8 +26,9 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 	delete process.env[ENV_KEY];
 	delete process.env[ENV_ROOT];
+	rmSync(root, { recursive: true, force: true });
+	rmSync(other, { recursive: true, force: true });
 });
-afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 /** A Connect stream as Devin sends it: gzip data frames carrying text in field 2, then an end frame. */
 function stream(text: string): Response {
@@ -49,55 +53,79 @@ function varint(n: number): number[] {
 }
 
 function scriptDevin(replies: string[]): void {
-	const requests: string[] = [];
 	vi.stubGlobal(
 		"fetch",
-		vi.fn(async (_url: string, init: RequestInit) => {
-			requests.push(gunzipSync(Buffer.from(init.body as Uint8Array).subarray(5)).toString("utf-8"));
-			return stream(replies.shift() ?? "");
-		}),
+		vi.fn(async () => stream(replies.shift() ?? "")),
 	);
 }
 
 const answer = (xml: string) => `Done.[TOOL_CALLS]answer[ARGS]${JSON.stringify({ answer: xml })}`;
 
-async function session(options: { roots?: boolean } = {}) {
+/** A connected client; with `roots`, it offers those directories and can change them later. */
+async function session(roots?: string[]) {
 	const server = createServer();
 	const client = new Client(
 		{ name: "devin-search-test", version: "0.0.0" },
-		options.roots ? { capabilities: { roots: {} } } : {},
+		roots ? { capabilities: { roots: { listChanged: true } } } : {},
 	);
-	if (options.roots) {
-		client.setRequestHandler(ListRootsRequestSchema, async () => ({ roots: [{ uri: pathToFileURL(root).href }] }));
+	if (roots) {
+		client.setRequestHandler(ListRootsRequestSchema, async () => ({
+			roots: roots.map((dir) => ({ uri: pathToFileURL(dir).href })),
+		}));
 	}
 	const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 	await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-	return { server, client };
+	return client;
 }
 
+const text = (result: unknown) => (result as { content: Array<{ text: string }> }).content[0]!.text;
+const locations = (result: unknown) =>
+	(result as { structuredContent: { locations: Array<{ path: string; ranges: number[][] }> } }).structuredContent
+		.locations;
+
 describe("MCP server", () => {
-	it("lists both search tools with their descriptions", async () => {
-		const { client } = await session();
+	it("lists both tools and tells the client when to use each, with the current year", async () => {
+		const client = await session();
 		const { tools } = await client.listTools();
 		expect(tools.map((t) => t.name).sort()).toEqual(["code_search", "web_search"]);
-		expect(tools.find((t) => t.name === "code_search")?.description).toContain("SWE-grep");
 		expect(tools.find((t) => t.name === "code_search")?.inputSchema.required).toEqual(["query"]);
+		const instructions = client.getInstructions() ?? "";
+		expect(instructions).toContain("Use `code_search` when");
+		expect(instructions).toContain(String(new Date().getFullYear()));
 		await client.close();
 	});
 
-	it("runs the SWE-grep loop against the client's root and returns locations", async () => {
+	it("runs the planner against the client's root and returns absolute locations", async () => {
 		scriptDevin([
 			'Searching.[TOOL_CALLS]restricted_exec[ARGS]{"command1":{"type":"rg","pattern":"export function retry","path":"/codebase/src"}}',
 			answer('<ANSWER><file path="/codebase/src/retry.ts"><range>1-3</range></file></ANSWER>'),
 		]);
-		const { client } = await session({ roots: true });
+		const client = await session([root]);
 		const result = await client.callTool({ name: "code_search", arguments: { query: "where does retry live" } });
 		expect(result.isError).toBeFalsy();
-		const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
-		expect(text).toContain("src/retry.ts (L1-3)");
-		expect((result.structuredContent as { locations: unknown }).locations).toEqual([
-			{ path: "src/retry.ts", ranges: [[1, 3]] },
-		]);
+		expect(text(result)).toContain(`${join(root, "src", "retry.ts")} (L1-3)`);
+		expect(locations(result)).toEqual([{ path: join(root, "src", "retry.ts"), ranges: [[1, 3]] }]);
+		await client.close();
+	});
+
+	it("searches whichever root holds an absolute path", async () => {
+		scriptDevin([answer('<ANSWER><file path="/codebase/billing.ts"><range>1-1</range></file></ANSWER>')]);
+		const client = await session([root, other]);
+		const result = await client.callTool({ name: "code_search", arguments: { query: "charging", path: other } });
+		expect(locations(result)).toEqual([{ path: join(other, "billing.ts"), ranges: [[1, 1]] }]);
+		await client.close();
+	});
+
+	it("asks for the roots again after the client reports a change", async () => {
+		const roots = [root];
+		const client = await session(roots);
+		scriptDevin([answer("<ANSWER></ANSWER>")]);
+		await client.callTool({ name: "code_search", arguments: { query: "q" } });
+		roots.splice(0, 1, other);
+		await client.sendRootsListChanged();
+		scriptDevin([answer('<ANSWER><file path="/codebase/billing.ts"><range>1-1</range></file></ANSWER>')]);
+		const result = await client.callTool({ name: "code_search", arguments: { query: "charging" } });
+		expect(locations(result)[0]?.path).toBe(join(other, "billing.ts"));
 		await client.close();
 	});
 
@@ -107,28 +135,30 @@ describe("MCP server", () => {
 			'Reading.[TOOL_CALLS]restricted_exec[ARGS]{"command1":{"type":"readfile","file":"/codebase/notes.md"}}',
 			answer('<ANSWER><file path="/codebase/notes.md"><range>1-1</range></file></ANSWER>'),
 		]);
-		const { client } = await session();
-		// `path` becomes the workspace the planner sees as /codebase; answers stay root-relative.
+		const client = await session();
+		// `path` becomes the directory the planner sees as /codebase.
 		const result = await client.callTool({ name: "code_search", arguments: { query: "notes", path: "src" } });
 		expect(result.isError).toBeFalsy();
-		expect((result.structuredContent as { locations: Array<{ path: string }> }).locations[0]?.path).toBe("src/notes.md");
+		expect(locations(result)[0]?.path).toBe(join(root, "src", "notes.md"));
 		await client.close();
 	});
 
 	it("refuses a path outside the workspace root", async () => {
-		const { client } = await session({ roots: true });
-		const result = await client.callTool({ name: "code_search", arguments: { query: "q", path: "../outside" } });
-		expect(result.isError).toBe(true);
-		expect((result.content as Array<{ type: string; text: string }>)[0]!.text).toContain("must be inside the workspace root");
+		const client = await session([root]);
+		for (const path of ["../outside", other]) {
+			const result = await client.callTool({ name: "code_search", arguments: { query: "q", path } });
+			expect(result.isError).toBe(true);
+			expect(text(result)).toMatch(/must be inside/);
+		}
 		await client.close();
 	});
 
-	it("tells the model how to sign in when there is no credential", async () => {
+	it("tells the model how to get a key when there is none", async () => {
 		delete process.env[ENV_KEY];
-		const { client } = await session({ roots: true });
-		const result = await client.callTool({ name: "code_search", arguments: { query: "q" } });
+		const client = await session([root]);
+		const result = await client.callTool({ name: "web_search", arguments: { query: "q" } });
 		expect(result.isError).toBe(true);
-		expect((result.content as Array<{ type: string; text: string }>)[0]!.text).toContain("devin-search-mcp login");
+		expect(text(result)).toContain("npx @astralyn/search login");
 		await client.close();
 	});
 
@@ -147,19 +177,18 @@ describe("MCP server", () => {
 					),
 			),
 		);
-		const { client } = await session();
+		const client = await session();
 		const result = await client.callTool({ name: "web_search", arguments: { query: "example", max_results: 2 } });
 		expect(result.isError).toBeFalsy();
-		const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
-		expect(text).toContain("https://example.com/a");
-		expect(text).toContain("first excerpt");
-		expect((result.structuredContent as { results: unknown }).results).toHaveLength(2);
+		expect(text(result)).toContain("https://example.com/a");
+		expect(text(result)).toContain("first excerpt");
+		expect((result.structuredContent as { results: unknown[] }).results).toHaveLength(2);
 		await client.close();
 	});
 
 	it("streams progress notifications while the planner works", async () => {
 		scriptDevin([answer("<ANSWER></ANSWER>")]);
-		const { client } = await session({ roots: true });
+		const client = await session([root]);
 		const messages: string[] = [];
 		client.setNotificationHandler(ProgressNotificationSchema, (notification) => {
 			messages.push(notification.params.message ?? "");
