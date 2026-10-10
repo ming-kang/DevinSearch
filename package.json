@@ -5,6 +5,10 @@
 	"type": "module",
 	"license": "MIT",
 	"author": "Astralyn",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ming-kang/DevinSearch.git"
+	},
 	"keywords": [
 		"mcp",
 		"mcp-server",
