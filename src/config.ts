@@ -5,4 +5,4 @@ export const ENV_KEY = "SEARCH_KEY";
 export const ENV_ROOT = "SEARCH_ROOT";
 
 /** How a user runs this package; every sign-in hint names it. */
-export const COMMAND = "npx @astralyn/search";
+export const COMMAND = "npx @astralyn/search@latest";

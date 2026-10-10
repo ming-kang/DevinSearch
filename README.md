@@ -10,7 +10,7 @@ An MCP server with two tools, powered by [Devin](https://devin.ai):
 1. Get a key. This opens Devin's sign-in page, and prints the key once you paste back the code Devin shows you:
 
    ```bash
-   npx @astralyn/search login
+   npx @astralyn/search@latest login
    ```
 
 2. Add the server to your MCP client, with the key in its `env`. On macOS and Linux:
@@ -20,7 +20,7 @@ An MCP server with two tools, powered by [Devin](https://devin.ai):
      "mcpServers": {
        "search": {
          "command": "npx",
-         "args": ["-y", "@astralyn/search"],
+         "args": ["-y", "@astralyn/search@latest"],
          "env": { "SEARCH_KEY": "<the key login printed>" }
        }
      }
@@ -34,7 +34,7 @@ An MCP server with two tools, powered by [Devin](https://devin.ai):
      "mcpServers": {
        "search": {
          "command": "cmd",
-         "args": ["/c", "npx", "-y", "@astralyn/search"],
+         "args": ["/c", "npx", "-y", "@astralyn/search@latest"],
          "env": { "SEARCH_KEY": "<the key login printed>" }
        }
      }

@@ -17,7 +17,7 @@ MCP client config:
   "mcpServers": {
     "search": {
       "command": "npx",
-      "args": ["-y", "@astralyn/search"],
+      "args": ["-y", "@astralyn/search@latest"],
       "env": { "${ENV_KEY}": "<the key login prints>" }
     }
   }

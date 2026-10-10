@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-10
+
+- Setup examples and sign-in hints name `@astralyn/search@latest`. The explicit tag keeps npm from resolving the bare package name to a local checkout when the server starts inside this repository, where npx would then look for a `search` bin that was never linked.
+
 ## [0.1.0] - 2026-10-10
 
 First release.

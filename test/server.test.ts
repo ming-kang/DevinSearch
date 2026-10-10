@@ -158,7 +158,7 @@ describe("MCP server", () => {
 		const client = await session([root]);
 		const result = await client.callTool({ name: "web_search", arguments: { query: "q" } });
 		expect(result.isError).toBe(true);
-		expect(text(result)).toContain("npx @astralyn/search login");
+		expect(text(result)).toContain("npx @astralyn/search@latest login");
 		await client.close();
 	});
 
