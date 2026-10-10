@@ -1,0 +1,179 @@
+name: Publish npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version to publish (for example, 0.1.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish the package accepted by CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install OIDC-capable npm
+        run: npm install --global npm@11.15.0 --ignore-scripts
+
+      - name: Verify release request
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Release workflow must run from main (got $GITHUB_REF)." >&2
+            exit 1
+          fi
+
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+
+          const version = process.env.RELEASE_VERSION;
+          if (!version || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
+            throw new Error(`Expected a stable numeric version such as 0.1.1, got ${version ?? "nothing"}.`);
+          }
+
+          const packageJson = JSON.parse(readFileSync("package.json", "utf8"));
+          const packageLock = JSON.parse(readFileSync("package-lock.json", "utf8"));
+          const changelog = readFileSync("CHANGELOG.md", "utf8");
+
+          if (packageJson.name !== "@astralyn/search") {
+            throw new Error(`Expected the root package to be @astralyn/search, got ${packageJson.name}.`);
+          }
+          if (
+            packageJson.version !== version ||
+            packageLock.version !== version ||
+            packageLock.packages?.[""]?.version !== version
+          ) {
+            throw new Error(
+              `Release input ${version} must match package.json (${packageJson.version}) and package-lock.json (${packageLock.version}).`,
+            );
+          }
+          const releaseHeading = `## [${version}] - `;
+          const headingCount = changelog
+            .split("\n")
+            .filter((line) => line.startsWith(releaseHeading)).length;
+          if (headingCount !== 1) {
+            throw new Error(
+              `Expected exactly one CHANGELOG.md release heading for ${version}, found ${headingCount}.`,
+            );
+          }
+          NODE
+
+      - name: Find successful CI for this commit
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ci_run="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --commit "$GITHUB_SHA" --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          if [ -z "$ci_run" ]; then
+            echo "Wait for CI to pass on $GITHUB_SHA before publishing." >&2
+            exit 1
+          fi
+          echo "run_id=$ci_run" >> "$GITHUB_OUTPUT"
+
+      - name: Download the package tested by CI
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/search-package
+          run-id: ${{ steps.ci.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Publish verified artifact
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: npm publish "$RUNNER_TEMP/search-package/astralyn-search-$RELEASE_VERSION.tgz" --access public --provenance --registry=https://registry.npmjs.org
+
+  release:
+    name: Tag and create the GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          import path from "node:path";
+          const version = process.env.RELEASE_VERSION;
+          const lines = readFileSync("CHANGELOG.md", "utf8").split("\n");
+          const start = lines.findIndex((line) => line.startsWith(`## [${version}] - `));
+          if (start === -1) {
+            throw new Error(`CHANGELOG.md has no release heading for ${version}.`);
+          }
+          let end = lines.length;
+          for (let i = start + 1; i < lines.length; i++) {
+            if (lines[i].startsWith("## ")) {
+              end = i;
+              break;
+            }
+          }
+          const notes = lines.slice(start + 1, end).join("\n").trim();
+          if (!notes) {
+            throw new Error(`CHANGELOG.md section for ${version} is empty.`);
+          }
+          writeFileSync(path.join(process.env.RUNNER_TEMP, "release-notes.md"), `${notes}\n`);
+          NODE
+
+      - name: Tag the release commit
+        run: |
+          if git rev-parse -q --verify "refs/tags/v$RELEASE_VERSION" >/dev/null; then
+            existing="$(git rev-parse "v$RELEASE_VERSION^{commit}")"
+            if [ "$existing" != "$RELEASE_SHA" ]; then
+              echo "Tag v$RELEASE_VERSION already exists at $existing, not the release commit $RELEASE_SHA." >&2
+              exit 1
+            fi
+            echo "Tag v$RELEASE_VERSION already exists at the release commit."
+          else
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                tag -a "v$RELEASE_VERSION" "$RELEASE_SHA" -m "release: $RELEASE_VERSION"
+            git push origin "v$RELEASE_VERSION"
+          fi
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release v$RELEASE_VERSION already exists."
+          else
+            gh release create "v$RELEASE_VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Search $RELEASE_VERSION" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --verify-tag
+          fi
