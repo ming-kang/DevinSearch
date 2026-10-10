@@ -13,7 +13,7 @@ An MCP server with two tools, powered by [Devin](https://devin.ai):
    npx @astralyn/search login
    ```
 
-2. Add the server to your MCP client, with the key in its `env`:
+2. Add the server to your MCP client, with the key in its `env`. On macOS and Linux:
 
    ```json
    {
@@ -27,9 +27,19 @@ An MCP server with two tools, powered by [Devin](https://devin.ai):
    }
    ```
 
-   With Claude Code: `claude mcp add search -e SEARCH_KEY=<key> -- npx -y @astralyn/search`.
+   On Windows, where many clients cannot start `npx` directly, run it through `cmd`:
 
-   On Windows, clients that cannot start `npx` directly need `"command": "cmd"` and `"args": ["/c", "npx", "-y", "@astralyn/search"]`.
+   ```json
+   {
+     "mcpServers": {
+       "search": {
+         "command": "cmd",
+         "args": ["/c", "npx", "-y", "@astralyn/search"],
+         "env": { "SEARCH_KEY": "<the key login printed>" }
+       }
+     }
+   }
+   ```
 
 3. Restart the client. The key in the server's `env` is the only authorization; nothing is written to disk.
 
