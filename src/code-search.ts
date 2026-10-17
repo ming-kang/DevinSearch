@@ -6,7 +6,6 @@
  * document of files and line ranges). After `MAX_TURNS` rounds the answer is demanded.
  */
 import { randomUUID } from "node:crypto";
-import { relative } from "node:path";
 import { type ChatMessage, chat } from "./devin.ts";
 import {
 	FORCE_ANSWER,
@@ -20,7 +19,7 @@ import {
 import { type Command, VIRTUAL_ROOT, Workspace } from "./workspace.ts";
 
 export interface CodeLocation {
-	/** Relative to the session's working directory. */
+	/** Absolute path. This server does not know the client's working directory. */
 	path: string;
 	ranges: Array<[number, number]>;
 }
@@ -28,9 +27,8 @@ export interface CodeLocation {
 export interface CodeSearchOptions {
 	apiKey: string;
 	query: string;
-	/** Directory to search; already confined to the working directory by the caller. */
+	/** Directory to search; already confined to a workspace root by the caller. */
 	root: string;
-	cwd: string;
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
 }
@@ -55,7 +53,7 @@ export async function codeSearch(options: CodeSearchOptions): Promise<CodeLocati
 		const call = parseToolCall(reply);
 
 		if (call?.name === "answer") {
-			return parseAnswer(String(call.args.answer ?? ""), workspace, options.cwd);
+			return parseAnswer(String(call.args.answer ?? ""), workspace);
 		}
 		if (call?.name !== "restricted_exec") {
 			messages.push({ role: "assistant", content: reply }, { role: "user", content: RETRY_TOOL_CALL });
@@ -131,13 +129,13 @@ const FILE_RE = /<file\s+path=(["'])(.+?)\1\s*>([\s\S]*?)<\/file>/g;
 const RANGE_RE = /<range>\s*(\d+)\s*-\s*(\d+)\s*<\/range>/g;
 
 /** The files of an `<ANSWER>`, each re-checked against the workspace; anything outside it is dropped. */
-export function parseAnswer(xml: string, workspace: Workspace, cwd: string): CodeLocation[] {
+export function parseAnswer(xml: string, workspace: Workspace): CodeLocation[] {
 	const locations: CodeLocation[] = [];
 	for (const [, , path, body] of xml.matchAll(FILE_RE)) {
 		const real = workspace.toReal(path);
 		if (!real) continue;
 		locations.push({
-			path: relative(cwd, real).replace(/\\/g, "/") || ".",
+			path: real,
 			ranges: [...body!.matchAll(RANGE_RE)]
 				.map(([, start, end]): [number, number] => [Number(start), Number(end)])
 				.sort((a, b) => a[0] - b[0]),
@@ -149,7 +147,7 @@ export function parseAnswer(xml: string, workspace: Workspace, cwd: string): Cod
 
 export function formatLocations(locations: CodeLocation[]): string {
 	if (!locations.length)
-		return "No relevant code found. Try a narrower behavioral query, or grep for a known identifier.";
+		return "No relevant code found. Try a narrower behavioral query, or search for a known identifier directly.";
 	const lines = locations.map(
 		({ path, ranges }) => `${path}${ranges.length ? ` (${ranges.map(([s, e]) => `L${s}-${e}`).join(", ")})` : ""}`,
 	);

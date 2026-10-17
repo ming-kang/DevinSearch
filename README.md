@@ -74,7 +74,16 @@ Ripgrep comes from the optional `@vscode/ripgrep` dependency; if that install fa
 | `query` | string | required | Be specific: product names, versions, exact error text. English matches best. |
 | `max_results` | integer | 5 | Results to return, 1 to 10. |
 
-The server's MCP instructions tell the model the current month, so it searches with the right year, and to cite the results it uses.
+Server instructions tell the model when to choose each tool, the current month, and to cite web results as `[Title](URL)`. They do not assume the host has its own file tools.
+
+## Prompts
+
+Clients that list MCP prompts can offer these. They are templates a person invokes, not a second pair of tools. A host that drops server instructions can still start a search from one.
+
+| Prompt | Arguments | Asks the model to |
+|---|---|---|
+| `locate` | `query`, optional `path` | Call `code_search` with a behavioral query, then read the returned ranges before editing. |
+| `lookup` | `query` | Call `web_search`, include the current year for a recent fact, and cite each result used. |
 
 ## Environment variables
 

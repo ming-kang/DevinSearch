@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-17
+
+- The server reports a display title, the repository URL, and a one-line description: semantic code search and live web search. The description does not name the backend; that does not help a model choose a tool.
+- Instructions say when to choose each tool, to read returned ranges before editing, and to cite web results. They no longer name the host's file tools or repeat the tool descriptions.
+- Prompts `locate` and `lookup` are user-invoked templates that ask the model to call `code_search` and `web_search` with the right query shape. `lookup` states the current month when it is fetched.
+- A web result repeats the citation line, because a host may not inject server instructions. An empty code search no longer tells the model to grep.
+- `code_search` returns absolute paths directly. It no longer makes them relative to a session working directory and resolves them again.
+
 ## [0.1.1] - 2026-10-10
 
 - Setup examples and sign-in hints name `@astralyn/search@latest`. The explicit tag keeps npm from resolving the bare package name to a local checkout when the server starts inside this repository, where npx would then look for a `search` bin that was never linked.

@@ -62,15 +62,15 @@ describe("code_search loop", () => {
 				'<ANSWER><file path="/codebase/src/retry.ts"><range>1-3</range></file><file path="/codebase/../outside.ts"><range>1-2</range></file></ANSWER>',
 			),
 		]);
-		const locations = await codeSearch({ apiKey: "k", query: "retry", root, cwd: root });
-		expect(locations).toEqual([{ path: "src/retry.ts", ranges: [[1, 3]] }]);
+		const locations = await codeSearch({ apiKey: "k", query: "retry", root });
+		expect(locations).toEqual([{ path: join(root, "src", "retry.ts"), ranges: [[1, 3]] }]);
 		expect(requests[1]).toContain("1:export function retry() {");
 	});
 
 	it("demands an answer once the planning rounds run out", async () => {
 		const call = '[TOOL_CALLS]restricted_exec[ARGS]{"command1":{"type":"tree","path":"/codebase"}}';
 		const requests = devin([...Array(MAX_TURNS).fill(call), answer("<ANSWER></ANSWER>")]);
-		await expect(codeSearch({ apiKey: "k", query: "q", root, cwd: root })).resolves.toEqual([]);
+		await expect(codeSearch({ apiKey: "k", query: "q", root })).resolves.toEqual([]);
 		expect(requests).toHaveLength(MAX_TURNS + 1);
 		expect(requests.at(-1)).toContain("You have no turns left");
 	});

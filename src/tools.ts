@@ -1,6 +1,5 @@
 /**
  * The two tools behind the MCP layer: argument checks, the credential, and the model-facing text.
- * Locations come back as absolute paths, since the client's working directory is unknown here.
  */
 import { isAbsolute, resolve } from "node:path";
 import { type CodeLocation, codeSearch, formatLocations } from "./code-search.ts";
@@ -48,18 +47,19 @@ export interface CodeSearchOptions {
 }
 
 /** An absolute `path` searches inside whichever root holds it; a relative one is under the first root. */
-function searchScope(roots: string[], path: string | undefined): { root: string; dir: string } {
+function searchDirectory(roots: string[], path: string | undefined): string {
 	const [first] = roots;
 	if (!first) throw new Error(`no workspace root: the client offers no MCP roots and ${ENV_ROOT} is unset.`);
 	const value = path?.trim();
 	if (value && isAbsolute(value)) {
-		const root = roots.find((r) => isInside(r, value));
-		if (!root) throw new Error(`path must be inside a workspace root (${roots.join(", ")}).`);
-		return { root, dir: resolve(value) };
+		if (!roots.some((root) => isInside(root, value))) {
+			throw new Error(`path must be inside a workspace root (${roots.join(", ")}).`);
+		}
+		return resolve(value);
 	}
 	const dir = resolve(first, value || ".");
 	if (!isInside(first, dir)) throw new Error(`path must be inside the workspace root (${first}).`);
-	return { root: first, dir };
+	return dir;
 }
 
 export async function runCodeSearch(
@@ -68,11 +68,15 @@ export async function runCodeSearch(
 ): Promise<{ text: string; locations: CodeLocation[] }> {
 	const query = args.query.trim();
 	if (!query) throw new Error("query must not be empty.");
-	const { root, dir } = searchScope(options.roots, args.path);
-	const found = await withDevin((apiKey) =>
-		codeSearch({ apiKey, query, root: dir, cwd: root, signal: options.signal, onProgress: options.onProgress }),
+	const locations = await withDevin((apiKey) =>
+		codeSearch({
+			apiKey,
+			query,
+			root: searchDirectory(options.roots, args.path),
+			signal: options.signal,
+			onProgress: options.onProgress,
+		}),
 	);
-	const locations = found.map((location) => ({ ...location, path: resolve(root, location.path) }));
 	return { text: formatLocations(locations), locations };
 }
 
@@ -86,7 +90,8 @@ export function formatWebResults(query: string, results: WebResult[]): string {
 		}
 		return lines.join("\n");
 	});
-	return `Web results for "${query}":\n\n${blocks.join("\n\n")}`;
+	// A host may not inject server instructions, and this is when the model has the URLs.
+	return `Web results for "${query}":\n\n${blocks.join("\n\n")}\n\nCite each result you use as [Title](URL).`;
 }
 
 export async function runWebSearch(

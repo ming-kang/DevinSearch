@@ -5,6 +5,7 @@ import { RootsListChangedNotificationSchema, type ServerNotification } from "@mo
 import { z } from "zod";
 import { COMMAND, ENV_KEY, ENV_ROOT } from "./config.ts";
 import { getApiKey } from "./credential.ts";
+import { instructions, registerPrompts, SERVER_INFO, SERVER_NAME } from "./guidance.ts";
 import {
 	CODE_SEARCH_DESCRIPTION,
 	type CodeSearchArgs,
@@ -15,20 +16,7 @@ import {
 } from "./tools.ts";
 import { SERVER_VERSION } from "./version.ts";
 
-const SERVER_NAME = "@astralyn/search";
-
-/** When to reach for each tool. MCP has no per-tool guidelines, so they travel as server instructions. */
-function instructions(): string {
-	// Models otherwise search with their training year; the month is taken when the session starts.
-	const month = new Date().toLocaleDateString("en-US", { month: "long", year: "numeric" });
-	return [
-		"Use `code_search` when you cannot name the file or symbol you need; use grep, glob, or read when you can.",
-		"Read the ranges `code_search` returns before editing; the locations are candidates, not answers.",
-		"Use `web_search` for information beyond your knowledge cutoff.",
-		`It is ${month}; put this year in \`web_search\` queries for recent releases, versions, or events, not the year your training data suggests.`,
-		"When an answer relies on `web_search` results, cite each result you used as a markdown link: [Title](URL).",
-	].join("\n");
-}
+const READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: true } as const;
 
 function progressReporter(
 	progressToken: unknown,
@@ -45,7 +33,7 @@ function progressReporter(
 }
 
 export function createServer(): McpServer {
-	const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: instructions() });
+	const server = new McpServer({ ...SERVER_INFO, version: SERVER_VERSION }, { instructions: instructions() });
 
 	// The client's file roots, asked for once and again after it reports a change; SEARCH_ROOT, then cwd, without them.
 	let roots: Promise<string[]> | undefined;
@@ -88,7 +76,7 @@ export function createServer(): McpServer {
 			outputSchema: {
 				locations: z.array(z.object({ path: z.string(), ranges: z.array(z.tuple([z.number(), z.number()])) })),
 			},
-			annotations: { readOnlyHint: true, openWorldHint: true },
+			annotations: READ_ONLY,
 		},
 		async (args: CodeSearchArgs, extra) => {
 			const { text, locations } = await runCodeSearch(args, {
@@ -118,7 +106,7 @@ export function createServer(): McpServer {
 					z.object({ url: z.string(), title: z.string().optional(), summary: z.string().optional() }),
 				),
 			},
-			annotations: { readOnlyHint: true, openWorldHint: true },
+			annotations: READ_ONLY,
 		},
 		async (args: WebSearchArgs, extra) => {
 			const { text, results } = await runWebSearch(args, extra.signal);
@@ -126,6 +114,7 @@ export function createServer(): McpServer {
 		},
 	);
 
+	registerPrompts(server);
 	return server;
 }
 

@@ -89,9 +89,38 @@ describe("MCP server", () => {
 		const { tools } = await client.listTools();
 		expect(tools.map((t) => t.name).sort()).toEqual(["code_search", "web_search"]);
 		expect(tools.find((t) => t.name === "code_search")?.inputSchema.required).toEqual(["query"]);
+		expect(client.getServerVersion()).toMatchObject({
+			title: "Search",
+			description: "Semantic code search and live web search.",
+			websiteUrl: "https://github.com/ming-kang/DevinSearch",
+		});
 		const instructions = client.getInstructions() ?? "";
 		expect(instructions).toContain("Use `code_search` when");
 		expect(instructions).toContain(String(new Date().getFullYear()));
+		expect(instructions).not.toMatch(/grep|\bglob\b|Devin/);
+		await client.close();
+	});
+
+	it("offers prompts that ask the model to call each tool", async () => {
+		const client = await session();
+		const { prompts } = await client.listPrompts();
+		expect(prompts.map((prompt) => prompt.name).sort()).toEqual(["locate", "lookup"]);
+		expect(prompts.every((prompt) => prompt.description)).toBe(true);
+
+		const locate = await client.getPrompt({
+			name: "locate",
+			arguments: { query: "where retry lives", path: "src" },
+		});
+		const locateText = locate.messages[0]?.content.type === "text" ? locate.messages[0].content.text : "";
+		expect(locateText).toContain("code_search");
+		expect(locateText).toContain("where retry lives");
+		expect(locateText).toContain("`src`");
+
+		const lookup = await client.getPrompt({ name: "lookup", arguments: { query: "mcp spec" } });
+		const lookupText = lookup.messages[0]?.content.type === "text" ? lookup.messages[0].content.text : "";
+		expect(lookupText).toContain("web_search");
+		expect(lookupText).toContain("mcp spec");
+		expect(lookupText).toContain(String(new Date().getFullYear()));
 		await client.close();
 	});
 
@@ -182,6 +211,7 @@ describe("MCP server", () => {
 		expect(result.isError).toBeFalsy();
 		expect(text(result)).toContain("https://example.com/a");
 		expect(text(result)).toContain("first excerpt");
+		expect(text(result)).toContain("Cite each result you use as [Title](URL).");
 		expect((result.structuredContent as { results: unknown[] }).results).toHaveLength(2);
 		await client.close();
 	});
