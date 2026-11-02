@@ -1,7 +1,15 @@
 import { fileURLToPath } from "node:url";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { RootsListChangedNotificationSchema, type ServerNotification } from "@modelcontextprotocol/sdk/types.js";
+import {
+	CLIENT_CAPABILITIES_META_KEY,
+	type ClientCapabilities,
+	type InputRequiredResult,
+	inputRequired,
+	inputResponse,
+	McpServer,
+	type ServerContext,
+	type ServerNotification,
+} from "@modelcontextprotocol/server";
+import { serveStdio as serve } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { COMMAND, ENV_KEY, ENV_ROOT } from "./config.ts";
 import { getApiKey } from "./credential.ts";
@@ -17,6 +25,17 @@ import {
 import { SERVER_VERSION } from "./version.ts";
 
 const READ_ONLY = { readOnlyHint: true, idempotentHint: true, openWorldHint: true } as const;
+
+/** Human guidance first, then serialized JSON for clients that only consume text. */
+function searchResult<T extends Record<string, unknown>>(text: string, structuredContent: T) {
+	return {
+		content: [
+			{ type: "text" as const, text },
+			{ type: "text" as const, text: JSON.stringify(structuredContent) },
+		],
+		structuredContent,
+	};
+}
 
 function progressReporter(
 	progressToken: unknown,
@@ -35,36 +54,63 @@ function progressReporter(
 export function createServer(): McpServer {
 	const server = new McpServer({ ...SERVER_INFO, version: SERVER_VERSION }, { instructions: instructions() });
 
-	// The client's file roots, asked for once and again after it reports a change; SEARCH_ROOT, then cwd, without them.
-	let roots: Promise<string[]> | undefined;
-	const workspaceRoots = (): Promise<string[]> => {
-		roots ??= (async () => {
+	const configuredRoots = () => [process.env[ENV_ROOT]?.trim() || process.cwd()];
+	const fileRoots = (roots: Array<{ uri: string }>): string[] =>
+		roots.flatMap((root) => {
+			const uri = root?.uri;
+			if (typeof uri !== "string" || !uri.startsWith("file://")) return [];
+			try {
+				return [fileURLToPath(uri)];
+			} catch {
+				return [];
+			}
+		});
+
+	// Legacy roots are cached until the client reports a change. Modern roots arrive per call through MRTR.
+	let legacyRoots: Promise<string[]> | undefined;
+	const legacyWorkspaceRoots = (): Promise<string[]> => {
+		legacyRoots ??= (async () => {
 			if (server.server.getClientCapabilities()?.roots) {
 				try {
-					const listed = (await server.server.listRoots()).roots
-						.filter((root) => root.uri.startsWith("file://"))
-						.map((root) => fileURLToPath(root.uri));
+					const listed = fileRoots((await server.server.listRoots()).roots);
 					if (listed.length) return listed;
 				} catch {}
 			}
-			return [process.env[ENV_ROOT]?.trim() || process.cwd()];
+			return configuredRoots();
 		})();
-		return roots;
+		return legacyRoots;
 	};
-	server.server.setNotificationHandler(RootsListChangedNotificationSchema, async () => {
-		roots = undefined;
+	server.server.setNotificationHandler("notifications/roots/list_changed", async () => {
+		legacyRoots = undefined;
 	});
+
+	const workspaceRoots = async (extra: ServerContext): Promise<string[] | InputRequiredResult> => {
+		const envelope = extra.mcpReq.envelope as
+			| Partial<Record<typeof CLIENT_CAPABILITIES_META_KEY, ClientCapabilities>>
+			| undefined;
+		if (!envelope) return legacyWorkspaceRoots();
+		if (!envelope[CLIENT_CAPABILITIES_META_KEY]?.roots) return configuredRoots();
+
+		const response = inputResponse(extra.mcpReq.inputResponses, "workspace");
+		if (response.kind === "roots") {
+			const listed = fileRoots(response.roots);
+			return listed.length ? listed : configuredRoots();
+		}
+		// A malformed or missing response must not cause an endless request/retry loop.
+		if (extra.mcpReq.inputResponses) return configuredRoots();
+		return inputRequired({ inputRequests: { workspace: inputRequired.listRoots() } });
+	};
 
 	server.registerTool(
 		"code_search",
 		{
 			title: "Code Search",
 			description: CODE_SEARCH_DESCRIPTION,
-			inputSchema: {
+			inputSchema: z.object({
 				query: z
 					.string()
 					.describe(
-						"Natural-language description of the behavior, flow, error, or concept to locate, in concise English. Keep identifiers, API names, and error text verbatim. Not for a bare symbol, filename, or literal.",
+						"One behavior, flow, or error to locate, in concise English. Keep identifiers and error text verbatim. Not for a bare symbol, filename, or literal.",
 					),
 				path: z
 					.string()
@@ -72,19 +118,23 @@ export function createServer(): McpServer {
 					.describe(
 						"Directory to search: absolute inside a workspace root, or relative to the first root. Defaults to the first root.",
 					),
-			},
-			outputSchema: {
-				locations: z.array(z.object({ path: z.string(), ranges: z.array(z.tuple([z.number(), z.number()])) })),
-			},
+			}),
+			outputSchema: z.object({
+				locations: z.array(
+					z.object({ path: z.string(), ranges: z.array(z.tuple([z.number().int(), z.number().int()])) }),
+				),
+			}),
 			annotations: READ_ONLY,
 		},
 		async (args: CodeSearchArgs, extra) => {
+			const roots = await workspaceRoots(extra);
+			if (!Array.isArray(roots)) return roots;
 			const { text, locations } = await runCodeSearch(args, {
-				roots: await workspaceRoots(),
-				signal: extra.signal,
-				onProgress: progressReporter(extra._meta?.progressToken, extra.sendNotification),
+				roots,
+				signal: extra.mcpReq.signal,
+				onProgress: progressReporter(extra.mcpReq._meta?.progressToken, extra.mcpReq.notify),
 			});
-			return { content: [{ type: "text", text }], structuredContent: { locations } };
+			return searchResult(text, { locations });
 		},
 	);
 
@@ -93,24 +143,24 @@ export function createServer(): McpServer {
 		{
 			title: "Web Search",
 			description: WEB_SEARCH_DESCRIPTION,
-			inputSchema: {
+			inputSchema: z.object({
 				query: z
 					.string()
 					.describe(
 						"Web search query. Be specific: product names, versions, exact error text. English matches best.",
 					),
 				max_results: z.number().int().min(1).max(10).optional().describe("Results to return (default 5)."),
-			},
-			outputSchema: {
+			}),
+			outputSchema: z.object({
 				results: z.array(
 					z.object({ url: z.string(), title: z.string().optional(), summary: z.string().optional() }),
 				),
-			},
+			}),
 			annotations: READ_ONLY,
 		},
 		async (args: WebSearchArgs, extra) => {
-			const { text, results } = await runWebSearch(args, extra.signal);
-			return { content: [{ type: "text", text }], structuredContent: { results } };
+			const { text, results } = await runWebSearch(args, extra.mcpReq.signal);
+			return searchResult(text, { results });
 		},
 	);
 
@@ -118,14 +168,13 @@ export function createServer(): McpServer {
 	return server;
 }
 
-/** stdout carries JSON-RPC only; anything for a person goes to stderr. */
-export async function serveStdio(): Promise<McpServer> {
-	const server = createServer();
-	await server.connect(new StdioServerTransport());
+/** Serve both protocol eras; stdout carries JSON-RPC only and anything for a person goes to stderr. */
+export function serveStdio() {
+	const handle = serve(createServer);
 	if (!getApiKey()) {
 		console.error(
 			`${SERVER_NAME}: no ${ENV_KEY} set. Run \`${COMMAND} login\` and add the key to this server's env.`,
 		);
 	}
-	return server;
+	return handle;
 }

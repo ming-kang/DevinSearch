@@ -28,7 +28,7 @@ async function main(): Promise<void> {
 	switch (command) {
 		case undefined:
 		case "serve":
-			await serveStdio();
+			serveStdio();
 			return;
 		case "login":
 			await login();

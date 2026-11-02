@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-02
+
+- Ported Pi's tighter `code_search` copy: the tool returns up to 10 candidates rather than every match, is primarily for orienting in unfamiliar code, and its results are a reading list before direct identifier searches.
+- Web search instructions, prompts, and results warn the model that page excerpts are untrusted data, not instructions to follow.
+- Tool results include both human-readable guidance and serialized JSON text alongside `structuredContent`, for clients using either result representation.
+- Migrated to the MCP TypeScript SDK v2 server packages and Zod 4. The stdio entry serves both `2026-07-28` and legacy clients; modern workspace roots use the multi-round-trip `input_required` flow, while legacy root change notifications remain supported.
+
 ## [0.2.0] - 2026-10-17
 
 - The server reports a display title, the repository URL, and a one-line description: semantic code search and live web search. The description does not name the backend; that does not help a model choose a tool.
