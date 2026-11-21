@@ -17,10 +17,22 @@ export const SERVER_TITLE = "Search";
 /** Catalog line. Naming the backend does not help a model choose a tool. */
 export const SERVER_DESCRIPTION = "Semantic code search and live web search.";
 
+/**
+ * A magnifier in a neutral slate that reads on both light and dark chrome. It is a data URI so
+ * the package stays a single-file build with no asset copies.
+ */
+export const SERVER_ICONS = [
+	{
+		src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='7' cy='7' r='4.5' fill='none' stroke='%2364748b' stroke-width='1.5'/%3E%3Cpath d='M10.5 10.5 14 14' stroke='%2364748b' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E",
+		mimeType: "image/svg+xml",
+	},
+];
+
 export const SERVER_INFO = {
 	name: SERVER_NAME,
 	title: SERVER_TITLE,
 	description: SERVER_DESCRIPTION,
+	icons: SERVER_ICONS,
 	...(SERVER_WEBSITE ? { websiteUrl: SERVER_WEBSITE } : {}),
 };
 
@@ -69,6 +81,7 @@ export function registerPrompts(server: McpServer): void {
 		{
 			title: "Locate code",
 			description: "Call `code_search` to locate behavior you cannot name as a file or symbol.",
+			icons: SERVER_ICONS,
 			argsSchema: z.object({
 				query: z.string().describe("One behavior, flow, or error to locate, in concise English."),
 				path: z
@@ -87,6 +100,7 @@ export function registerPrompts(server: McpServer): void {
 		{
 			title: "Look up",
 			description: "Call `web_search` for information beyond your knowledge cutoff.",
+			icons: SERVER_ICONS,
 			argsSchema: z.object({
 				query: z
 					.string()

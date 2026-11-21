@@ -13,7 +13,7 @@ import { serveStdio as serve } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { COMMAND, ENV_KEY, ENV_ROOT } from "./config.ts";
 import { getApiKey } from "./credential.ts";
-import { instructions, registerPrompts, SERVER_INFO, SERVER_NAME } from "./guidance.ts";
+import { instructions, registerPrompts, SERVER_ICONS, SERVER_INFO, SERVER_NAME } from "./guidance.ts";
 import {
 	CODE_SEARCH_DESCRIPTION,
 	type CodeSearchArgs,
@@ -52,7 +52,18 @@ function progressReporter(
 }
 
 export function createServer(): McpServer {
-	const server = new McpServer({ ...SERVER_INFO, version: SERVER_VERSION }, { instructions: instructions() });
+	const server = new McpServer(
+		{ ...SERVER_INFO, version: SERVER_VERSION },
+		{
+			instructions: instructions(),
+			// Catalogs and discovery are identical for every client and change only with the build.
+			cacheHints: {
+				"tools/list": { ttlMs: 86_400_000, cacheScope: "public" },
+				"prompts/list": { ttlMs: 86_400_000, cacheScope: "public" },
+				"server/discover": { ttlMs: 3_600_000, cacheScope: "public" },
+			},
+		},
+	);
 
 	const configuredRoots = () => [process.env[ENV_ROOT]?.trim() || process.cwd()];
 	const fileRoots = (roots: Array<{ uri: string }>): string[] =>
@@ -74,7 +85,10 @@ export function createServer(): McpServer {
 				try {
 					const listed = fileRoots((await server.server.listRoots()).roots);
 					if (listed.length) return listed;
-				} catch {}
+				} catch {
+					// A transient failure must not pin the fallback for the rest of the session.
+					legacyRoots = undefined;
+				}
 			}
 			return configuredRoots();
 		})();
@@ -125,6 +139,7 @@ export function createServer(): McpServer {
 				),
 			}),
 			annotations: READ_ONLY,
+			icons: SERVER_ICONS,
 		},
 		async (args: CodeSearchArgs, extra) => {
 			const roots = await workspaceRoots(extra);
@@ -150,17 +165,25 @@ export function createServer(): McpServer {
 						"Web search query. Be specific: product names, versions, exact error text. English matches best.",
 					),
 				max_results: z.number().int().min(1).max(10).optional().describe("Results to return (default 5)."),
+				domain: z.string().optional().describe("Restrict results to one domain, e.g. 'docs.rs' or 'github.com'."),
 			}),
 			outputSchema: z.object({
 				results: z.array(
 					z.object({ url: z.string(), title: z.string().optional(), summary: z.string().optional() }),
 				),
+				summary: z.string().optional(),
+				web_search_url: z.string().optional(),
 			}),
 			annotations: READ_ONLY,
+			icons: SERVER_ICONS,
 		},
 		async (args: WebSearchArgs, extra) => {
-			const { text, results } = await runWebSearch(args, extra.mcpReq.signal);
-			return searchResult(text, { results });
+			const { text, results, summary, webSearchUrl } = await runWebSearch(args, extra.mcpReq.signal);
+			return searchResult(text, {
+				results,
+				...(summary ? { summary } : {}),
+				...(webSearchUrl ? { web_search_url: webSearchUrl } : {}),
+			});
 		},
 	);
 

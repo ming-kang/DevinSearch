@@ -109,7 +109,21 @@ describe("MCP server", () => {
 		expect(instructions).toContain("untrusted data");
 		expect(instructions).toContain(String(new Date().getFullYear()));
 		expect(instructions).not.toMatch(/grep|\bglob\b|Devin/);
+		for (const tool of tools) expect(tool.icons?.[0]?.src).toMatch(/^data:image\/svg\+xml/);
 		await client.close();
+	});
+
+	it("advertises public cache hints to a modern client only", async () => {
+		const modern = await session(undefined, true);
+		const listed = (await modern.listTools()) as { ttlMs?: number; cacheScope?: string };
+		expect(listed.ttlMs).toBe(86_400_000);
+		expect(listed.cacheScope).toBe("public");
+		await modern.close();
+
+		const legacy = await session();
+		const old = (await legacy.listTools()) as { ttlMs?: number };
+		expect(old.ttlMs).toBeUndefined();
+		await legacy.close();
 	});
 
 	it("serves 2026-07-28 and fulfills workspace roots through input_required", async () => {
@@ -170,6 +184,30 @@ describe("MCP server", () => {
 		const client = await session([root, other]);
 		const result = await client.callTool({ name: "code_search", arguments: { query: "charging", path: other } });
 		expect(locations(result)).toEqual([{ path: join(other, "billing.ts"), ranges: [[1, 1]] }]);
+		await client.close();
+	});
+
+	it("re-asks for the roots when the first listing fails", async () => {
+		let calls = 0;
+		const client = new Client(
+			{ name: "devin-search-test", version: "0.0.0" },
+			{ capabilities: { roots: { listChanged: true } } },
+		);
+		client.setRequestHandler("roots/list", async () => {
+			calls++;
+			if (calls === 1) throw new Error("transient");
+			return { roots: [{ uri: pathToFileURL(root).href }] };
+		});
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const server = createServer();
+		await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+		scriptDevin([answer('<ANSWER><file path="/codebase/src/retry.ts"><range>1-3</range></file></ANSWER>')]);
+		await client.callTool({ name: "code_search", arguments: { query: "q" } });
+		scriptDevin([answer('<ANSWER><file path="/codebase/src/retry.ts"><range>1-3</range></file></ANSWER>')]);
+		const result = await client.callTool({ name: "code_search", arguments: { query: "q" } });
+		expect(calls).toBe(2);
+		expect(locations(result)[0]?.path).toBe(join(root, "src", "retry.ts"));
 		await client.close();
 	});
 

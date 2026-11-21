@@ -15,9 +15,14 @@ afterAll(() => rmSync(root, { recursive: true, force: true }));
 afterEach(() => vi.unstubAllGlobals());
 
 /** A Connect stream as Devin sends it: gzip data frames carrying text in field 2, then an end frame. */
-function stream(text: string, end: object = {}): Response {
+function stream(text: string, end: object = {}, toolCalls: Array<{ name: string; args: object }> = []): Response {
 	const data = Buffer.from(text, "utf-8");
-	const message = gzipSync(Buffer.concat([Buffer.from([0x12, ...varint(data.length)]), data]));
+	const fields = [Buffer.from([0x12, ...varint(data.length)]), data];
+	for (const call of toolCalls) {
+		const message = Buffer.concat([field(1, "call-1"), field(2, call.name), field(3, JSON.stringify(call.args))]);
+		fields.push(Buffer.from([0x1a, ...varint(message.length)]), message);
+	}
+	const message = gzipSync(Buffer.concat(fields));
 	const trailer = Buffer.from(JSON.stringify(end));
 	const frame = (flags: number, body: Buffer) => {
 		const head = Buffer.alloc(5);
@@ -26,6 +31,11 @@ function stream(text: string, end: object = {}): Response {
 		return Buffer.concat([head, body]);
 	};
 	return new Response(new Uint8Array(Buffer.concat([frame(1, message), frame(2, trailer)])));
+}
+
+function field(no: number, value: string): Buffer {
+	const data = Buffer.from(value, "utf-8");
+	return Buffer.concat([Buffer.from([(no << 3) | 2, ...varint(data.length)]), data]);
 }
 
 function varint(n: number): number[] {
@@ -37,15 +47,18 @@ function varint(n: number): number[] {
 	return [...out, n];
 }
 
+type Reply = string | { text: string; toolCalls: Array<{ name: string; args: object }> };
+
 /** Script Devin's replies and record every request body it receives. */
-function devin(replies: string[]): string[] {
+function devin(replies: Reply[]): string[] {
 	const requests: string[] = [];
 	vi.stubGlobal(
 		"fetch",
 		vi.fn(async (_url: string, init: RequestInit) => {
 			const body = Buffer.from(init.body as Uint8Array);
 			requests.push(gunzipSync(body.subarray(5)).toString("utf-8"));
-			return stream(replies.shift() ?? "");
+			const reply = replies.shift() ?? "";
+			return typeof reply === "string" ? stream(reply) : stream(reply.text, {}, reply.toolCalls);
 		}),
 	);
 	return requests;
@@ -81,6 +94,31 @@ describe("code_search loop", () => {
 		);
 		expect(call?.args).toEqual({ command1: { type: "rg", pattern: "\\{\\}" } });
 	});
+
+	it("uses a structured tool_calls frame instead of parsing reply text", async () => {
+		devin([
+			{
+				text: "Searching.",
+				toolCalls: [
+					{
+						name: "restricted_exec",
+						args: { command1: { type: "readfile", file: "/codebase/src/retry.ts" } },
+					},
+				],
+			},
+			{
+				text: "",
+				toolCalls: [
+					{
+						name: "answer",
+						args: { answer: '<ANSWER><file path="/codebase/src/retry.ts"><range>1-2</range></file></ANSWER>' },
+					},
+				],
+			},
+		]);
+		const locations = await codeSearch({ apiKey: "k", query: "retry", root });
+		expect(locations).toEqual([{ path: join(root, "src", "retry.ts"), ranges: [[1, 2]] }]);
+	});
 });
 
 describe("Devin responses", () => {
@@ -107,10 +145,32 @@ describe("Devin responses", () => {
 					),
 			),
 		);
-		await expect(webSearch("k", "q", 5)).resolves.toEqual([
+		const { results } = await webSearch("k", "q", 5);
+		expect(results).toEqual([
 			{ url: "https://example.com/a", title: "A", summary: "excerpt" },
 			{ url: "http://example.com/c" },
 		]);
+	});
+
+	it("passes a domain restriction through and surfaces the search URL", async () => {
+		let body: { query?: string; domain?: string } = {};
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (_url: string, init: RequestInit) => {
+				body = JSON.parse(String(init.body));
+				return new Response(
+					JSON.stringify({
+						results: [{ url: "https://docs.rs/a", title: "A" }],
+						summary: "A synthesized answer.",
+						webSearchUrl: "https://www.google.com/search?q=a",
+					}),
+				);
+			}),
+		);
+		const response = await webSearch("k", "serde", 5, "docs.rs");
+		expect(body.domain).toBe("docs.rs");
+		expect(response.summary).toBe("A synthesized answer.");
+		expect(response.webSearchUrl).toBe("https://www.google.com/search?q=a");
 	});
 });
 
@@ -172,7 +232,7 @@ describe("workspace rg", () => {
 		const lines = (await new Workspace(repo).run({ type: "rg", pattern: "hit", path: "/codebase/many" })).split("\n");
 		expect(lines[0]).toMatch(/^63 matches in 31 files;/);
 		expect(lines[1]).toBe("/codebase/many/z.ts: 3");
-		expect(lines.length).toBeLessThanOrEqual(41);
+		expect(lines.length).toBeLessThanOrEqual(51);
 	});
 });
 
@@ -217,7 +277,7 @@ describe("workspace visibility and paging", () => {
 		const lines = (await new Workspace(repo).run({ type: "readfile", file: "src/a.ts", end_line: 100 })).split("\n");
 		expect(lines[0]).toBe("/codebase/src/a.ts (100 lines)");
 		expect(lines[1]).toBe("1:line 1");
-		expect(lines.at(-1)).toBe("... (lines 41-100 not shown; continue with start_line=41)");
+		expect(lines.at(-1)).toBe("... (lines 51-100 not shown; continue with start_line=51)");
 	});
 
 	it("shallows a tree that would not fit rather than cutting it off", async () => {
@@ -225,5 +285,35 @@ describe("workspace visibility and paging", () => {
 		expect(out.split("\n")).toHaveLength(32);
 		expect(out).toMatch(/├── p0\/\n/);
 		expect(out).toMatch(/\(levels reduced to 1 to fit\)$/);
+	});
+
+	it("ls hides dotfiles unless asked, and stays out of ignored directories", async () => {
+		write("src/.hidden.ts", "x\n");
+		const workspace = new Workspace(repo);
+		const out = await workspace.run({ type: "ls", path: "/codebase/src" });
+		expect(out).toBe("a.ts");
+		expect(await workspace.run({ type: "ls", path: "/codebase/src", all: true })).toBe(".hidden.ts\na.ts");
+		expect(await workspace.run({ type: "ls", path: "/codebase/dist" })).toMatch(/not searchable/);
+	});
+
+	it("ls long format annotates directories and file sizes", async () => {
+		write("pkgs/z.ts", "12345\n");
+		const out = await new Workspace(repo).run({ type: "ls", path: "/codebase/pkgs/p0", long_format: true });
+		expect(out).toMatch(/^\s+2 {2}index\.ts$/m);
+	});
+
+	it("glob matches files, directories, or both under the path", async () => {
+		const workspace = new Workspace(repo);
+		expect(await workspace.run({ type: "glob", pattern: "src/*.ts", path: "/codebase" })).toContain(
+			"/codebase/src/a.ts",
+		);
+		expect(
+			await workspace.run({ type: "glob", pattern: "pkgs/*", path: "/codebase", type_filter: "directory" }),
+		).toBe(
+			Array.from({ length: 30 }, (_, i) => `/codebase/pkgs/p${i}/`)
+				.sort()
+				.join("\n"),
+		);
+		expect(await workspace.run({ type: "glob", pattern: "*.env", path: "/codebase" })).toBe("(no matches)");
 	});
 });

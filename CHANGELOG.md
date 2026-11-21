@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-21
+
+- Aligned `code_search` with Devin's current fast-context contract: the planner gets six command slots per round plus `ls` and `glob` sub-commands, command results cap at 50 lines, and the planner's reasoning rides in the transcript's `thinking` field.
+- The planner's calls are read from the stream's structured `tool_calls` frames when present; the `[TOOL_CALLS]` text parse remains as a fallback.
+- `ls` lists a directory (dotfiles hidden unless `all`, sizes in `long_format`); `glob` matches files by ripgrep's own glob semantics and directories by a small matcher. Both keep the same confinement and ignore-file rules as `rg`, `readfile`, and `tree`.
+- Each local command now has a 30-second budget, `readfile` reads asynchronously and refuses files over 4 MiB, and the repo map no longer splits a line when a level-1 tree exceeds its budget.
+- `web_search` accepts an optional `domain` to restrict results, and surfaces Devin's `summary` and `web_search_url` when it sends them.
+- Modern (`2026-07-28`) clients get SEP-2549 cache hints on `tools/list`, `prompts/list`, and `server/discover`, and icons on the server, tools, and prompts.
+- A failed legacy `roots/list` no longer pins the configured-root fallback for the rest of the session; the server asks again next call.
+
 ## [0.3.0] - 2026-11-02
 
 - Ported Pi's tighter `code_search` copy: the tool returns up to 10 candidates rather than every match, is primarily for orienting in unfamiliar code, and its results are a reading list before direct identifier searches.
