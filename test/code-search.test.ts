@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
-import { codeSearch, parseToolCall } from "../src/code-search.ts";
+import { codeSearch, parseAnswer, parseToolCall } from "../src/code-search.ts";
 import { DevinAuthError, decodeChatResponse, webSearch } from "../src/devin.ts";
 import { MAX_TURNS } from "../src/prompt.ts";
 import { Workspace } from "../src/workspace.ts";
@@ -13,6 +13,14 @@ mkdirSync(join(root, "src"));
 writeFileSync(join(root, "src", "retry.ts"), "export function retry() {\n  return 1;\n}\n");
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 afterEach(() => vi.unstubAllGlobals());
+
+/** A Connect frame: flags byte, big-endian length, payload. */
+function frameOf(flags: number, payload: Buffer): Buffer {
+	const head = Buffer.alloc(5);
+	head[0] = flags;
+	head.writeUInt32BE(payload.length, 1);
+	return Buffer.concat([head, payload]);
+}
 
 /** A Connect stream as Devin sends it: gzip data frames carrying text in field 2, then an end frame. */
 function stream(text: string, end: object = {}, toolCalls: Array<{ name: string; args: object }> = []): Response {
@@ -24,13 +32,7 @@ function stream(text: string, end: object = {}, toolCalls: Array<{ name: string;
 	}
 	const message = gzipSync(Buffer.concat(fields));
 	const trailer = Buffer.from(JSON.stringify(end));
-	const frame = (flags: number, body: Buffer) => {
-		const head = Buffer.alloc(5);
-		head[0] = flags;
-		head.writeUInt32BE(body.length, 1);
-		return Buffer.concat([head, body]);
-	};
-	return new Response(new Uint8Array(Buffer.concat([frame(1, message), frame(2, trailer)])));
+	return new Response(new Uint8Array(Buffer.concat([frameOf(1, message), frameOf(2, trailer)])));
 }
 
 function field(no: number, value: string): Buffer {
@@ -86,6 +88,14 @@ describe("code_search loop", () => {
 		await expect(codeSearch({ apiKey: "k", query: "q", root })).resolves.toEqual([]);
 		expect(requests).toHaveLength(MAX_TURNS + 1);
 		expect(requests.at(-1)).toContain("You have no turns left");
+	});
+
+	it("repairs a bare key without rewriting key-shaped text inside a string value", () => {
+		// `path:` lacks quotes, forcing the repair pass; `{ y: 1 }` inside the pattern must survive it.
+		const call = parseToolCall(
+			'[TOOL_CALLS]restricted_exec[ARGS]{"command1":{"type":"rg","pattern":"if (x) { y: 1 }",path:"/codebase"}}',
+		);
+		expect(call?.args).toEqual({ command1: { type: "rg", pattern: "if (x) { y: 1 }", path: "/codebase" } });
 	});
 
 	it("keeps braces inside string values when finding the end of the arguments", () => {
@@ -171,6 +181,68 @@ describe("Devin responses", () => {
 		expect(body.domain).toBe("docs.rs");
 		expect(response.summary).toBe("A synthesized answer.");
 		expect(response.webSearchUrl).toBe("https://www.google.com/search?q=a");
+	});
+});
+
+describe("transport boundaries", () => {
+	it("rejects a truncated frame, reserved flags, and a corrupt gzip payload", () => {
+		expect(() => decodeChatResponse(Buffer.from([1, 0, 0]))).toThrow(/truncated planner frame/);
+		expect(() => decodeChatResponse(Buffer.concat([frameOf(0, Buffer.alloc(0)), Buffer.from([1, 2])]))).toThrow(
+			/truncated planner frame/,
+		);
+		expect(() => decodeChatResponse(frameOf(0x04, Buffer.from("x")))).toThrow(/reserved flags/);
+		expect(() => decodeChatResponse(frameOf(1, Buffer.from("not gzip at all")))).toThrow(/malformed planner frame/);
+	});
+
+	it("rejects malformed protobuf inside a data frame", () => {
+		const payload = (bytes: number[]) => frameOf(0, Buffer.from(bytes));
+		expect(() => decodeChatResponse(payload([0x00]))).toThrow(/malformed protobuf/);
+		expect(() => decodeChatResponse(payload([0x12, 0x80]))).toThrow(/malformed protobuf/);
+		expect(() => decodeChatResponse(payload([0x12, 0x64]))).toThrow(/malformed protobuf/);
+		expect(() => decodeChatResponse(payload([0x0b]))).toThrow(/malformed protobuf/);
+	});
+
+	it("caps the decompressed text a gzip frame can expand to", () => {
+		const bomb = frameOf(1, gzipSync(Buffer.alloc(32 * 1024 * 1024)));
+		expect(() => decodeChatResponse(bomb)).toThrow(/too large/);
+	});
+
+	it("decodes multi-byte UTF-8 characters split across field chunks", () => {
+		const bytes = Buffer.from("你好世界", "utf-8");
+		const part1 = bytes.subarray(0, 4); // splits the second 3-byte character
+		const part2 = bytes.subarray(4);
+		const fld = (buf: Buffer) => Buffer.concat([Buffer.from([0x12, buf.length]), buf]);
+		const body = Buffer.concat([frameOf(0, fld(part1)), frameOf(0, fld(part2)), frameOf(2, Buffer.from("{}"))]);
+		expect(decodeChatResponse(body).text).toBe("你好世界");
+	});
+
+	it("rejects a malformed end frame", () => {
+		expect(() => decodeChatResponse(frameOf(2, Buffer.from("{oops")))).toThrow(/malformed planner end frame/);
+	});
+
+	it("refuses a web search reply past the byte budget", async () => {
+		const rows = Array.from({ length: 60_000 }, (_, i) => ({ url: `https://example.com/${i}` }));
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(JSON.stringify({ results: rows }))),
+		);
+		await expect(webSearch("k", "q", 5)).rejects.toThrow(/web search reply exceeded/);
+	});
+});
+
+describe("answer ranges", () => {
+	const workspace = new Workspace(root);
+
+	it("drops zero, inverted, and non-safe-integer ranges but keeps the rest in order", () => {
+		const locations = parseAnswer(
+			'<ANSWER><file path="/codebase/src/retry.ts"><range>0-5</range><range>5-2</range><range>4-4</range><range>1-3</range><range>1-99999999999999999999</range></file></ANSWER>',
+			workspace,
+		);
+		expect(locations).toHaveLength(1);
+		expect(locations[0]!.ranges).toEqual([
+			[1, 3],
+			[4, 4],
+		]);
 	});
 });
 
@@ -315,5 +387,30 @@ describe("workspace visibility and paging", () => {
 				.join("\n"),
 		);
 		expect(await workspace.run({ type: "glob", pattern: "*.env", path: "/codebase" })).toBe("(no matches)");
+	});
+});
+
+describe("workspace resource boundaries", () => {
+	const repo = mkdtempSync(join(tmpdir(), "search-bounds-"));
+	afterAll(() => rmSync(repo, { recursive: true, force: true }));
+	writeFileSync(join(repo, "a.ts"), "const a = 1;\n");
+
+	it("does not run a command whose signal is already aborted", async () => {
+		const aborted = new AbortController();
+		aborted.abort();
+		expect(await new Workspace(repo).run({ type: "readfile", file: "a.ts" }, aborted.signal)).toMatch(/abort/i);
+	});
+
+	it("retries the file index after an aborted attempt instead of replaying the rejection", async () => {
+		const workspace = new Workspace(repo);
+		const aborted = new AbortController();
+		aborted.abort();
+		expect(await workspace.run({ type: "tree", path: "/codebase" }, aborted.signal)).toMatch(/abort/i);
+		expect(await workspace.run({ type: "tree", path: "/codebase" })).toContain("/codebase");
+	});
+
+	it("refuses a file past the read budget rather than loading it", async () => {
+		writeFileSync(join(repo, "huge.txt"), Buffer.alloc(5 * 1024 * 1024, 0x61));
+		expect(await new Workspace(repo).run({ type: "readfile", file: "huge.txt" })).toMatch(/read limit/);
 	});
 });

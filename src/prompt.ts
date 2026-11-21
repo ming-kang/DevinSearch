@@ -168,7 +168,7 @@ export const RETRY_TOOL_CALL =
 
 const COMMAND_SCHEMA = {
 	type: "object",
-	description: "Must be one of: rg, readfile, or tree.",
+	description: "Must be one of: rg, readfile, tree, ls, or glob.",
 	oneOf: [
 		{
 			properties: {

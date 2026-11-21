@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-21
+
+- Fixed `restricted_exec`'s command schema, which described itself as "rg, readfile, or tree" while also accepting `ls` and `glob`.
+- Hardened the Devin transport: protobuf fields and Connect frames are strictly validated (truncated frames, reserved flags, malformed wire data), every body read is byte-bounded (errors 64 KiB, web results 2 MiB, planner 8 MiB), gzip frames have a per-frame decompression cap, and multi-byte UTF-8 no longer corrupts across field chunks.
+- `readfile` now reads at most its byte budget through an open handle — a growing file cannot exceed it — and honours cancellation mid-read; rg's stderr is capped and a failed file index retries on the next command instead of sticking.
+- Argument repair no longer rewrites key-shaped text inside string values, and malformed or inverted `<range>` lines in an answer are dropped rather than forwarded.
+
 ## [0.3.1] - 2026-11-21
 
 - Aligned `code_search` with Devin's current fast-context contract: the planner gets six command slots per round plus `ls` and `glob` sub-commands, command results cap at 50 lines, and the planner's reasoning rides in the transcript's `thinking` field.

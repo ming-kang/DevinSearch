@@ -20,6 +20,16 @@ const WEB_CLIENT_VERSION = "1.9600.41";
 const CHAT_TIMEOUT_MS = 60_000;
 const WEB_TIMEOUT_MS = 30_000;
 
+/**
+ * Read ceilings, one per body shape, so a hostile or broken backend cannot be read unbounded. An
+ * error is a short JSON status; a web search returns at most ten results with excerpts; the planner
+ * streams a whole turn of transcript. The planner budget is also a decompressed-text budget.
+ */
+const ERROR_BODY_MAX_BYTES = 64 * 1024;
+const WEB_RESULTS_MAX_BYTES = 2 * 1024 * 1024;
+const PLANNER_MAX_BYTES = 8 * 1024 * 1024;
+const PLANNER_MAX_TEXT_BYTES = 8 * 1024 * 1024;
+
 export class DevinError extends Error {
 	override name = "DevinError";
 }
@@ -27,6 +37,12 @@ export class DevinError extends Error {
 /** The credential is missing, revoked, or malformed; only signing in again fixes it. */
 export class DevinAuthError extends DevinError {
 	override name = "DevinAuthError";
+}
+
+/** A POST and the signal that bounds reading its body, shared with the request's timeout. */
+interface DevinResponse {
+	response: Response;
+	signal: AbortSignal;
 }
 
 function errorFor(code: string | number, message = ""): DevinError {
@@ -39,25 +55,92 @@ function errorFor(code: string | number, message = ""): DevinError {
 	return new DevinError(`Devin request failed (${code}${message ? `: ${message}` : ""}).`);
 }
 
-async function post(url: string, init: RequestInit, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+async function post(url: string, init: RequestInit, timeoutMs: number, signal?: AbortSignal): Promise<DevinResponse> {
 	const timeout = AbortSignal.timeout(timeoutMs);
+	// Reading the body shares the request's budget, so a slow body cannot outlive the timeout.
+	const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
 	let response: Response;
 	try {
 		response = await fetch(url, {
 			...init,
 			method: "POST",
 			redirect: "error",
-			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+			signal: requestSignal,
 		});
 	} catch (e) {
 		if (signal?.aborted) throw e;
 		throw new DevinError(timeout.aborted ? "Devin did not answer in time." : `Could not reach Devin: ${String(e)}`);
 	}
 	if (!response.ok) {
-		const body = (await response.json().catch(() => undefined)) as { code?: string; message?: string } | undefined;
+		const body = await readErrorBody(response, requestSignal);
 		throw errorFor(body?.code ?? response.status, body?.message);
 	}
-	return response;
+	return { response, signal: requestSignal };
+}
+
+/**
+ * Read a body into a Buffer through the stream reader, rejecting past `maxBytes` instead of
+ * loading it whole. `external` distinguishes the caller's own cancellation from the timeout.
+ */
+async function readBounded(
+	response: Response,
+	maxBytes: number,
+	overflowMessage: string,
+	signal: AbortSignal,
+	external?: AbortSignal,
+): Promise<Buffer> {
+	if (!response.body) {
+		const bytes = Buffer.from(await response.arrayBuffer());
+		if (bytes.length > maxBytes) throw new DevinError(overflowMessage);
+		return bytes;
+	}
+	const reader = response.body.getReader();
+	const abort = () => reader.cancel().catch(() => {});
+	signal.addEventListener("abort", abort, { once: true });
+	try {
+		const chunks: Buffer[] = [];
+		let total = 0;
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) return Buffer.concat(chunks);
+			total += value.length;
+			if (total > maxBytes) throw new DevinError(overflowMessage);
+			chunks.push(Buffer.from(value));
+		}
+	} catch (e) {
+		if (external?.aborted) throw e;
+		if (e instanceof DevinError) throw e;
+		throw new DevinError(
+			signal.aborted ? "Devin did not answer in time." : `Devin sent an unreadable reply (${String(e)}).`,
+		);
+	} finally {
+		signal.removeEventListener("abort", abort);
+		reader.releaseLock();
+	}
+}
+
+/** The status JSON of a failed call, bounded; an unreadable body leaves the HTTP status to speak. */
+async function readErrorBody(
+	response: Response,
+	signal: AbortSignal,
+): Promise<{ code?: string | number; message?: string } | undefined> {
+	let bytes: Buffer;
+	try {
+		bytes = await readBounded(response, ERROR_BODY_MAX_BYTES, "Devin sent an oversized error body", signal);
+	} catch (error) {
+		// A cancelled or timed-out read is the caller's own outcome, not a status to translate.
+		if (signal.aborted) throw error;
+		return undefined;
+	}
+	try {
+		const body = JSON.parse(bytes.toString("utf-8")) as { code?: unknown; message?: unknown } | null;
+		if (!body || typeof body !== "object") return undefined;
+		const code = typeof body.code === "string" || typeof body.code === "number" ? body.code : undefined;
+		const message = typeof body.message === "string" ? body.message : undefined;
+		return code === undefined && message === undefined ? undefined : { code, message };
+	} catch {
+		return undefined;
+	}
 }
 
 // --- Protobuf, just enough for these messages ---
@@ -78,32 +161,49 @@ function field(no: number, value: string | number | Buffer): Buffer {
 	return Buffer.concat([Buffer.from([...varint((no << 3) | 2), ...varint(data.length)]), data]);
 }
 
-/** The length-delimited values of field `no` at the top level of `data`. */
-function readField(data: Buffer, no: number): Buffer[] {
-	const out: Buffer[] = [];
+/**
+ * The length-delimited values of field `no` at the top level of `data`. Every tag, varint, and
+ * length is checked, so a truncated or hostile payload fails here instead of yielding a short
+ * answer: field 0, group wire types, and overlong or unterminated varints are all malformed.
+ */
+function readField(data: Uint8Array, no: number): Uint8Array[] {
+	const out: Uint8Array[] = [];
 	let i = 0;
+	/** A base-128 varint of at most ten bytes; running out of data means it was never terminated. */
 	const readVarint = (): number => {
 		let value = 0;
-		for (let shift = 0; i < data.length; shift += 7) {
+		for (let byte = 0; byte < 10; byte++) {
+			if (i >= data.length) throw malformed();
 			const b = data[i++]!;
-			value += (b & 0x7f) * 2 ** shift;
-			if (!(b & 0x80)) break;
+			value += (b & 0x7f) * 2 ** (byte * 7);
+			if (!(b & 0x80)) return value;
 		}
-		return value;
+		throw malformed();
+	};
+	const skip = (bytes: number): void => {
+		if (i + bytes > data.length) throw malformed();
+		i += bytes;
 	};
 	while (i < data.length) {
 		const tag = readVarint();
+		const field = tag >>> 3;
+		if (field === 0) throw malformed();
 		const wire = tag & 7;
 		if (wire === 0) readVarint();
-		else if (wire === 1) i += 8;
-		else if (wire === 5) i += 4;
+		else if (wire === 1) skip(8);
+		else if (wire === 5) skip(4);
 		else if (wire === 2) {
 			const length = readVarint();
-			if (tag >>> 3 === no) out.push(data.subarray(i, i + length));
+			if (i + length > data.length) throw malformed();
+			if (field === no) out.push(data.subarray(i, i + length));
 			i += length;
-		} else break;
+		} else throw malformed();
 	}
 	return out;
+}
+
+function malformed(): DevinError {
+	return new DevinError("Devin sent a malformed protobuf message.");
 }
 
 // --- Planner turn ---
@@ -150,26 +250,62 @@ export interface StreamToolCall {
 }
 
 /**
- * Connect streaming envelopes: a flags byte (bit 0 gzip, bit 1 end-of-stream) and a length. Data
- * frames carry text chunks in field 2 and may carry structured ChatToolCall messages in field 3;
- * the end frame is JSON that names an error, if any.
+ * Connect streaming envelopes: a flags byte (bit 0 gzip, bit 1 end-of-stream) and a big-endian
+ * length. Data frames carry text chunks in field 2 and may carry structured ChatToolCall messages
+ * in field 3; the end frame is JSON that names an error, if any. Bits 2..7 of the flags byte are
+ * unused, and every header, length, and varint is checked.
  */
+const FRAME_HEADER_BYTES = 5;
+const RESERVED_FLAGS = 0xfc;
+
 export function decodeChatResponse(body: Buffer): { text: string; toolCalls: StreamToolCall[] } {
+	const decoder = new TextDecoder();
 	let text = "";
+	let textBytes = 0;
 	const toolCalls: StreamToolCall[] = [];
 	let i = 0;
-	while (i + 5 <= body.length) {
+	while (i < body.length) {
+		if (i + FRAME_HEADER_BYTES > body.length) {
+			throw new DevinError("Devin sent a truncated planner frame.");
+		}
 		const flags = body[i]!;
+		if (flags & RESERVED_FLAGS) {
+			throw new DevinError("Devin sent a planner frame with reserved flags.");
+		}
 		const length = body.readUInt32BE(i + 1);
-		let payload = body.subarray(i + 5, i + 5 + length);
-		i += 5 + length;
-		if (flags & 1) payload = gunzipSync(payload);
+		i += FRAME_HEADER_BYTES;
+		if (i + length > body.length) {
+			throw new DevinError("Devin sent a truncated planner frame.");
+		}
+		let payload = body.subarray(i, i + length);
+		i += length;
+		if (flags & 1) {
+			// A budget per frame as well as in total: gzip can expand a small frame past memory.
+			try {
+				payload = gunzipSync(payload, { maxOutputLength: Math.max(1, PLANNER_MAX_TEXT_BYTES - textBytes + 1) });
+			} catch (error) {
+				throw error instanceof RangeError
+					? new DevinError("Devin's planner reply was too large.")
+					: new DevinError("Devin sent a malformed planner frame.");
+			}
+		}
 		if (flags & 2) {
-			const end = JSON.parse(payload.toString("utf-8") || "{}") as { error?: { code?: string; message?: string } };
-			if (end.error) throw errorFor(end.error.code ?? "unknown", end.error.message);
+			let end: { error?: { code?: string; message?: string } };
+			try {
+				end = JSON.parse(payload.toString("utf-8") || "{}") as { error?: { code?: string; message?: string } };
+			} catch {
+				throw new DevinError("Devin sent a malformed planner end frame.");
+			}
+			if (end?.error) throw errorFor(end.error.code ?? "unknown", end.error.message);
 			continue;
 		}
-		for (const chunk of readField(payload, 2)) text += chunk.toString("utf-8");
+		for (const chunk of readField(payload, 2)) {
+			text += decoder.decode(chunk, { stream: true });
+			textBytes += chunk.length;
+		}
+		if (textBytes > PLANNER_MAX_TEXT_BYTES) {
+			throw new DevinError("Devin's planner reply was too large.");
+		}
 		for (const call of readField(payload, 3)) {
 			const [id] = readField(call, 1);
 			const [name] = readField(call, 2);
@@ -177,13 +313,14 @@ export function decodeChatResponse(body: Buffer): { text: string; toolCalls: Str
 			const args = readField(call, 3)[0] ?? readField(call, 4)[0];
 			if (name && args) {
 				toolCalls.push({
-					id: id?.toString("utf-8") ?? "",
-					name: name.toString("utf-8"),
-					argumentsJson: args.toString("utf-8"),
+					id: id ? Buffer.from(id).toString("utf-8") : "",
+					name: Buffer.from(name).toString("utf-8"),
+					argumentsJson: Buffer.from(args).toString("utf-8"),
 				});
 			}
 		}
 	}
+	text += decoder.decode();
 	return { text, toolCalls };
 }
 
@@ -197,7 +334,7 @@ export async function chat(
 	const envelope = Buffer.alloc(5);
 	envelope[0] = 1;
 	envelope.writeUInt32BE(message.length, 1);
-	const response = await post(
+	const { response, signal: requestSignal } = await post(
 		`${SERVICE}/GetDevstralStream`,
 		{
 			headers: {
@@ -212,7 +349,14 @@ export async function chat(
 		CHAT_TIMEOUT_MS,
 		signal,
 	);
-	return decodeChatResponse(Buffer.from(await response.arrayBuffer()));
+	const bytes = await readBounded(
+		response,
+		PLANNER_MAX_BYTES,
+		`Devin's planner reply exceeded ${PLANNER_MAX_BYTES} bytes`,
+		requestSignal,
+		signal,
+	);
+	return decodeChatResponse(bytes);
 }
 
 // --- Web search ---
@@ -239,7 +383,7 @@ export async function webSearch(
 	domain?: string,
 	signal?: AbortSignal,
 ): Promise<WebSearchResponse> {
-	const response = await post(
+	const { response, signal: requestSignal } = await post(
 		`${SERVICE}/GetWebSearchResults`,
 		{
 			headers: { "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
@@ -253,9 +397,19 @@ export async function webSearch(
 		WEB_TIMEOUT_MS,
 		signal,
 	);
-	const body = (await response.json().catch(() => undefined)) as
-		| { results?: unknown; summary?: unknown; webSearchUrl?: unknown }
-		| undefined;
+	const bytes = await readBounded(
+		response,
+		WEB_RESULTS_MAX_BYTES,
+		`Devin's web search reply exceeded ${WEB_RESULTS_MAX_BYTES} bytes`,
+		requestSignal,
+		signal,
+	);
+	let body: { results?: unknown; summary?: unknown; webSearchUrl?: unknown };
+	try {
+		body = JSON.parse(bytes.toString("utf-8")) as typeof body;
+	} catch {
+		throw new DevinError("Devin returned a malformed web search response.");
+	}
 	const results = body?.results;
 	if (!Array.isArray(results)) throw new DevinError("Devin returned a malformed web search response.");
 	const items = results.flatMap((row): WebResult[] => {
